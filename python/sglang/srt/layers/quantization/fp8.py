@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     block_fp8_scale_to_mxfp8_e8m0,
+    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
     cutlass_fp8_supported,
@@ -80,6 +81,9 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
+    _bf16_gemm_dispatch_impl,
+    bf16_gemm_dispatch,
+    get_bf16_gemm_backend,
 )
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -90,6 +94,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
 )
@@ -398,7 +403,9 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUMXFP8LinearMethod(self)
-            return Fp8LinearMethod(self)
+            method = Fp8LinearMethod(self)
+            method.bf16_decode_proj = _bf16_decode_proj_module(prefix)
+            return method
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
@@ -479,6 +486,20 @@ class Fp8Config(QuantizationConfig):
             )
 
 
+_bf16_decode_proj_stats = {"layers": 0, "bytes": 0, "logged": False}
+
+
+def _bf16_decode_proj_module(prefix: str) -> Optional[str]:
+    """SGLANG_BF16_DECODE_PROJ: name of the self_attn projection at `prefix` if
+    it is selected for the small-M bf16 path, else None."""
+    if not envs.SGLANG_BF16_DECODE_PROJ.get():
+        return None
+    parts = prefix.split(".")
+    if "self_attn" in parts and parts[-1] in envs.SGLANG_BF16_DECODE_PROJ_MODULES.get():
+        return parts[-1]
+    return None
+
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -554,6 +575,9 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+        # Set by Fp8Config.get_quant_method; None keeps the FP8-only path.
+        self.bf16_decode_proj: Optional[str] = None
+        self.bf16_decode_fused_a = None
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -814,6 +838,8 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             return
         else:
+            if self.bf16_decode_proj is not None:
+                self._keep_bf16_decode_weight(layer)
             # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
             requant_block_scale_ue8m0_for_deepgemm(
                 layer.weight,
@@ -1212,6 +1238,104 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def _keep_bf16_decode_weight(self, layer: Module) -> None:
+        """SGLANG_BF16_DECODE_PROJ: keep a bf16 copy of this block-FP8 weight,
+        dequantized from the checkpoint scales before the UE8M0 requant."""
+        weight, scale = layer.weight, layer.weight_scale_inv
+        if (
+            self.use_marlin
+            or weight.dim() != 2
+            or weight.dtype != torch.float8_e4m3fn
+            or scale.dtype != torch.float32
+            or getattr(scale, "format_ue8m0", False)
+            or self.weight_block_size != [128, 128]
+            or getattr(layer, "orig_dtype", None) != torch.bfloat16
+        ):
+            return
+        w16 = block_quant_dequant(
+            weight.data.to(scale.device), scale.data, [128, 128], torch.bfloat16
+        )
+        if getattr(layer, "weight_bf16_decode", None) is None:
+            _bf16_decode_proj_stats["layers"] += 1
+            _bf16_decode_proj_stats["bytes"] += w16.numel() * w16.element_size()
+        layer.weight_bf16_decode = w16
+        self.bf16_decode_max_tokens = envs.SGLANG_BF16_DECODE_PROJ_MAX_TOKENS.get()
+        self.bf16_decode_kernel = envs.SGLANG_BF16_DECODE_PROJ_KERNEL.get()
+        # Same small-M kernel the bf16 checkpoint path uses for these layers
+        # (DeepseekV2AttentionMLA.prepare_qkv_latent / q_b_proj_forward).
+        n, k = w16.shape
+        if (
+            self.bf16_decode_kernel == "auto"
+            and (
+                self.bf16_decode_proj == "fused_qkv_a_proj_with_mqa"
+                or (
+                    self.bf16_decode_proj == "q_b_proj"
+                    and (n, k) in ((2048, 2048), (4096, 2048))
+                )
+            )
+            and n % 16 == 0
+            and k % 256 == 0
+            and torch.cuda.get_device_capability()[0] >= 9
+            and not get_exec().deterministic.enable_deterministic_inference
+        ):
+            from sglang.kernels.ops.gemm.fused_a_gemm import dsv3_fused_a_gemm
+
+            self.bf16_decode_fused_a = dsv3_fused_a_gemm
+
+    def _apply_bf16_decode(
+        self, layer: Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """SGLANG_BF16_DECODE_PROJ: run a call with <= max_tokens rows on the bf16
+        copy; None falls through to block-FP8. M is fixed per captured CUDA
+        graph, so each graph bakes in one path."""
+        w16 = getattr(layer, "weight_bf16_decode", None)
+        if (
+            w16 is None
+            or isinstance(x, tuple)
+            or x.dim() != 2
+            or x.shape[0] > self.bf16_decode_max_tokens
+            or x.dtype != torch.bfloat16
+            or w16.shape != layer.weight.shape
+        ):
+            return None
+        m = x.shape[0]
+        if (
+            self.bf16_decode_fused_a is not None
+            and bias is None
+            and 1 <= m <= 16
+            and x.is_contiguous()
+        ):
+            kernel = "fused_a_gemm"
+            out = self.bf16_decode_fused_a(x, w16.T)
+        elif (
+            self.bf16_decode_kernel != "torch"
+            and get_bf16_gemm_backend().is_cutedsl()
+            and (bias is None or bias.dtype == torch.bfloat16)
+        ):
+            kernel = "bf16_gemm_dispatch"
+            if torch.compiler.is_compiling():
+                out = bf16_gemm_dispatch(x, w16, bias)
+            else:
+                out = _bf16_gemm_dispatch_impl(x, w16, bias)
+        else:
+            kernel = "torch"
+            out = F.linear(x, w16, bias)
+        if not _bf16_decode_proj_stats["logged"]:
+            _bf16_decode_proj_stats["logged"] = True
+            logger.info(
+                "SGLANG_BF16_DECODE_PROJ engaged: bf16 copies of %d layers "
+                "(%.2f GB), max_tokens=%d; first call %s M=%d N=%d K=%d kernel=%s",
+                _bf16_decode_proj_stats["layers"],
+                _bf16_decode_proj_stats["bytes"] / 1e9,
+                self.bf16_decode_max_tokens,
+                self.bf16_decode_proj,
+                m,
+                w16.shape[0],
+                w16.shape[1],
+                kernel,
+            )
+        return out
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1302,6 +1426,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     x.dtype,
                     True,  # is_vnni
                 )
+
+            if self.bf16_decode_proj is not None:
+                out = self._apply_bf16_decode(layer, x, bias)
+                if out is not None:
+                    return out
 
             cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
             extra_kwargs = (
