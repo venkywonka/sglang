@@ -123,16 +123,12 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
-def _should_elide_dsa_index_k(
-    *, is_draft_worker: bool, supports_sparse_transfer: bool = True
-) -> bool:
-    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries.
-
-    ``supports_sparse_transfer`` is False for pools whose PD transfer still
-    slices the per-layer list positionally and so cannot tolerate the gaps.
-    """
+def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
-    if not supports_sparse_transfer and get_disagg().disaggregation_mode != "null":
+    # Ascend PD slices the KV list positionally (index-K rides in it, not in
+    # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
+    if _is_npu and get_disagg().disaggregation_mode != "null":
         return False
     return (
         not memory_config.enable_hisparse
@@ -1943,16 +1939,7 @@ class KVCacheConfigurator:
         use_compact_indexer_layout = (
             is_dsa_model
             and is_arch35
-            and _should_elide_dsa_index_k(
-                is_draft_worker=self.is_draft_worker,
-                # AscendKVManager.get_mla_kv_ptrs_with_pp slices the buffer list
-                # into equal groups of hidden_kv_layers, and NPU index-K rides in
-                # the KV list rather than StateType.DSA, so the Mooncake filter
-                # never sees it. A compact layout would mis-slice a PP>1 prefill
-                # against a PP=1 decode. Lift this once that slicing reads
-                # indexer_layer_ids.
-                supports_sparse_transfer=False,
-            )
+            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:

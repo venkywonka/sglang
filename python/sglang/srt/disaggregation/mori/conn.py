@@ -46,7 +46,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, is_elided_entry
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -1493,6 +1493,7 @@ class MoriKVManager(CommonKVManager):
                         src_descs,
                         src_lens,
                         dst_descs,
+                        dst_lens,
                         st,
                     )
                 )
@@ -1600,6 +1601,7 @@ class MoriKVManager(CommonKVManager):
         src_state_mem_descs: List[MemoryDesc],
         src_state_item_lens: List[int],
         dst_state_mem_descs: List[MemoryDesc],
+        dst_state_item_lens: List[int],
         state_type: str,
     ) -> List[TransferStatus]:
         # TP mismatch check for non-MLA SWA
@@ -1678,12 +1680,11 @@ class MoriKVManager(CommonKVManager):
         for i, src_desc in enumerate(src_state_mem_descs):
             dst_desc = dst_state_mem_descs[i]
             state_item_len = src_state_item_lens[i]
-            if state_item_len == 0:
+            if is_elided_entry(state_item_len, dst_state_item_lens, i):
                 # DSA index-K elision gives every shared-topk layer a 0-row
-                # buffer so the per-layer list stays layer-aligned. There is
-                # nothing to move, and the descriptor describes an empty
-                # allocation. Skipping keeps the index alignment with
-                # state_mem_descs that registration relies on.
+                # buffer; either peer eliding it means nothing moves, and the
+                # descriptor describes an empty allocation. Skipping keeps the
+                # index alignment with state_mem_descs that registration relies on.
                 continue
 
             statuses.extend(

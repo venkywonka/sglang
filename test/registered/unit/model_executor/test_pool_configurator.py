@@ -1018,9 +1018,51 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         # index_topk_freq 4 with skip offset 3 leaves 3 of the 6 layers
         # producing index-K; the other 3 get a 0-row buffer and cost nothing.
         producer_layers = 3
-        self.assertEqual(
-            cfg._cell_size, 576 * num_layers + 132 * producer_layers
-        )
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * producer_layers)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_ascend_pd_sizing_stays_dense_like_its_allocation(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """Ascend PD allocates index-K for every layer, so sizing must price
+        every layer too; sizing used to elide while allocation did not, which
+        over-estimated KV capacity."""
+        num_layers = 6
+        producer_layers = 3
+        for is_npu, mode, priced_layers in (
+            (True, "prefill", num_layers),
+            (True, "null", producer_layers),
+            (False, "prefill", producer_layers),
+        ):
+            with self.subTest(is_npu=is_npu, mode=mode):
+                mr = _make_model_runner(
+                    self,
+                    num_layers=num_layers,
+                    use_mla_backend=True,
+                    disaggregation_mode=mode,
+                )
+                _configure_dsa_model(mr)
+                mr.model_config.hf_config.index_topk_freq = 4
+                mr.model_config.hf_config.index_skip_topk_offset = 3
+
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.kv_cache_configurator._is_npu",
+                        is_npu,
+                    ),
+                    mock_cpu_env(kv_size=1),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        DefaultPoolConfigurator,
+                    )
+
+                    cfg = DefaultPoolConfigurator(mr)
+
+                self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * priced_layers)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
@@ -1052,9 +1094,7 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         # index_topk_freq 4 with skip offset 3 leaves 3 of the 6 layers
         # producing index-K; the other 3 get a 0-row buffer and cost nothing.
         producer_layers = 3
-        self.assertEqual(
-            cfg._cell_size, 576 * num_layers + 132 * producer_layers
-        )
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * producer_layers)
 
 
 class TestFactory(CustomTestCase):
