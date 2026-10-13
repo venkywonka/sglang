@@ -22,7 +22,7 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.environ import envs
+from sglang.srt.environ import DSAIndexerTPSplitMode, envs
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
     DSAIndexerMetadata,
@@ -1774,8 +1774,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _tp_split_in_graph_replay() -> bool:
         # The BCG indexer break op re-runs eagerly between segment replays, so its
         # all-gather is never captured; capture and warmup stay replicated.
-        if not envs.SGLANG_ENABLE_DSA_TP_SPLIT_IN_GRAPH.get():
-            return False
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             is_breakable_cuda_graph_replaying,
         )
@@ -1794,12 +1792,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # (attn-TP group, lo, hi, rows per rank), or None for the replicated path.
         # Every input here is identical on all ranks of the group (same batch, env,
         # mode), so all ranks take the same branch and the all-gather cannot diverge.
-        if not envs.SGLANG_DSA_INDEXER_TP_SPLIT.get() or not _is_cuda:
+        # Raises ValueError on an undefined mode instead of guessing one.
+        mode = DSAIndexerTPSplitMode(envs.SGLANG_DSA_INDEXER_TP_SPLIT.get())
+        if mode == DSAIndexerTPSplitMode.OFF or not _is_cuda:
             return None
         if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
             return None
         in_graph = get_is_capture_mode() or torch.cuda.is_current_stream_capturing()
-        if in_graph and not self._tp_split_in_graph_replay():
+        if in_graph and not (
+            mode >= DSAIndexerTPSplitMode.EAGER_AND_BCG_REPLAY
+            and self._tp_split_in_graph_replay()
+        ):
             return None
         group = get_parallel().attn_tp_group
         tp = group.world_size
@@ -1822,7 +1825,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             Indexer._tp_split_logged = True
             logger.info(
                 "DSA indexer: prefill logits/top-k rows split across attn-TP "
-                f"(SGLANG_DSA_INDEXER_TP_SPLIT=1, tp={tp}): {q_offset} rows, "
+                f"(SGLANG_DSA_INDEXER_TP_SPLIT={int(mode)}, tp={tp}): {q_offset} rows, "
                 f"this rank [{bounds[rank]}, {bounds[rank + 1]})"
             )
         sizes = [hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])]
@@ -1830,7 +1833,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             Indexer._tp_split_graph_logged = True
             logger.info(
                 "DSA indexer: TP split in breakable prefill CUDA graph replay "
-                f"(SGLANG_ENABLE_DSA_TP_SPLIT_IN_GRAPH=1, tp={tp}): {q_offset} rows, "
+                f"(SGLANG_DSA_INDEXER_TP_SPLIT={int(mode)}, tp={tp}): {q_offset} rows, "
                 f"rows per rank {sizes}, this rank [{bounds[rank]}, {bounds[rank + 1]})"
             )
         return group, bounds[rank], bounds[rank + 1], sizes

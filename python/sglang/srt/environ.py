@@ -248,6 +248,20 @@ class InvariantCheckLevel(IntEnum):
     STRICT = 2
 
 
+class DSAIndexerTPSplitMode(IntEnum):
+    """Where the DSA prefill indexer splits its extend rows across attn-TP ranks.
+
+    OFF: every rank computes all rows (replicated).
+    EAGER: split eager prefill only; captured graphs stay replicated.
+    EAGER_AND_BCG_REPLAY: also split the indexer break op during breakable
+        prefill CUDA graph replay; capture and warmup stay replicated.
+    """
+
+    OFF = 0
+    EAGER = 1
+    EAGER_AND_BCG_REPLAY = 2
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -1770,14 +1784,12 @@ class Envs:
     # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
     # WAR-safe.
     SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
-    # Opt-in: split the extend rows of the ragged DSA indexer (logits + top-k)
-    # across the attention-TP group and all-gather the top-k indices, instead
-    # of every rank computing all rows. Only when rows >= MIN_ROWS.
-    SGLANG_DSA_INDEXER_TP_SPLIT = EnvBool(False)
+    # Split DSA prefill indexer rows across attn-TP (DSAIndexerTPSplitMode). PAGED
+    # top-k: without SGLANG_DSA_DEDUPE_CHUNK_GATHER=1 it copies page rows per token.
+    SGLANG_DSA_INDEXER_TP_SPLIT = EnvInt(DSAIndexerTPSplitMode.OFF)
+    # Shorter extends stay replicated and skip the per-layer all_gatherv. No
+    # measurement is recorded for 1024; safe to re-tune per model and attn-TP size.
     SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(1024)
-    # Opt-in (needs SGLANG_DSA_INDEXER_TP_SPLIT): also split when the indexer
-    # runs as the eager break op of a breakable prefill CUDA graph replay.
-    SGLANG_ENABLE_DSA_TP_SPLIT_IN_GRAPH = EnvBool(False)
     # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
     # directly into the persistent fp8 kv buffer and zero the pad band in one
     # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
