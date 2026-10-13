@@ -366,12 +366,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         def add(ptrs: List[int], lens: List[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
                 if length == 0:
-                    # DSA index-K elision gives every shared-topk layer a 0-row
-                    # buffer so the per-layer list stays layer-aligned. There is
-                    # nothing to register, and Mooncake rejects it outright:
-                    #   transfer_engine_impl.cpp: Transfer Engine does not
-                    #   support zero length memory region
-                    # kv_args keeps the entry, so peers still pair positionally.
+                    # Elided DSA index-K; the transfer engine rejects 0-length
+                    # regions, and kv_args keeps the entry for positional pairing.
                     continue
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
@@ -842,13 +838,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"lengths but paired entry dst[{j}] needs one"
                     )
                 if is_elided_entry(
-                    item_lens[i],
-                    dst_item_lens,
-                    j,
+                    src_len=item_lens[i],
+                    dst_lens=dst_item_lens,
+                    dst_index=j,
                     allow_dst_elision=state_type == StateType.DSA,
                 ):
-                    # One peer elided this shared-topk layer's index-K (e.g. a
-                    # dense HiSparse decode); no bytes move, so no stride to match.
+                    # One peer elided this index-K entry; no bytes move.
                     continue
                 if item_lens[i] != dst_item_lens[j]:
                     return (
@@ -872,12 +867,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         for layer_id in range(layers_current_pp_stage):
             if is_elided_entry(
-                item_lens[layer_id],
-                mapped_dst_lens,
-                layer_id,
+                src_len=item_lens[layer_id],
+                dst_lens=mapped_dst_lens,
+                dst_index=layer_id,
                 allow_dst_elision=state_type == StateType.DSA,
             ):
-                continue  # Elided by one peer; see the paired loop above.
+                continue
             if item_lens[layer_id] != mapped_dst_lens[layer_id]:
                 return (
                     f"{state_type} item length mismatch for positional "
@@ -1068,9 +1063,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
                     for i, j in pairs
                     if not is_elided_entry(
-                        item_lens[i],
-                        dst_item_lens,
-                        j,
+                        src_len=item_lens[i],
+                        dst_lens=dst_item_lens,
+                        dst_index=j,
                         allow_dst_elision=state_type == StateType.DSA,
                     )
                 ]
@@ -1093,9 +1088,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     for layer_id in range(layers_current_pp_stage)
                     if not is_elided_entry(
-                        item_lens[layer_id],
-                        mapped_dst_lens,
-                        layer_id,
+                        src_len=item_lens[layer_id],
+                        dst_lens=mapped_dst_lens,
+                        dst_index=layer_id,
                         allow_dst_elision=state_type == StateType.DSA,
                     )
                 ]

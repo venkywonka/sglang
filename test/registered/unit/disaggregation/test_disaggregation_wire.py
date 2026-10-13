@@ -961,13 +961,8 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(kv_args.state_layer_ids[1:], [[], []])
 
     def test_elided_dsa_layers_are_not_registered(self):
-        """A 0-row index-K buffer must not reach Mooncake's registration.
-
-        The engine rejects it outright ("Transfer Engine does not support zero
-        length memory region"). Skipping happens in _registerable_regions, not
-        in kv_args, so the per-layer list keeps its dense shape and peers still
-        pair positionally.
-        """
+        """A 0-row index-K buffer must not reach Mooncake registration, which
+        rejects 0-length regions; kv_args itself keeps the dense per-layer list."""
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.kv_args = SimpleNamespace(
             kv_data_ptrs=[],
@@ -982,18 +977,22 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(regions, [(100, 4096), (103, 4096), (105, 4096)])
 
     def test_stride_check_accepts_one_sided_elided_dsa_entry(self):
-        """A prefill that elides a shared-topk layer's index-K must still pair
-        with a dense decode (and the reverse): the registration-time stride
-        check used to reject the decode with "prefill=0 decode=64", failing
-        every request to it. A real stride disagreement is still rejected."""
+        """A DSA index-K entry elided on one peer only (an elided prefill against
+        a dense HiSparse decode, or the reverse) must pass the stride check on
+        both pairing paths. A real stride disagreement, and a one-sided zero on
+        any non-DSA state type, must still be rejected."""
         for layer_ids in ([], [3, 4]):
-            for src_lens, dst_lens, expect_ok in (
-                ([0, 132], [64, 132], True),
-                ([64, 132], [0, 132], True),
-                ([132, 132], [64, 132], False),
+            for state_type, src_lens, dst_lens, expect_ok in (
+                (StateType.DSA, [0, 132], [64, 132], True),
+                (StateType.DSA, [64, 132], [0, 132], True),
+                (StateType.DSA, [132, 132], [64, 132], False),
+                (StateType.SWA, [64, 132], [0, 132], False),
             ):
                 with self.subTest(
-                    layer_ids=layer_ids, src_lens=src_lens, dst_lens=dst_lens
+                    layer_ids=layer_ids,
+                    state_type=state_type,
+                    src_lens=src_lens,
+                    dst_lens=dst_lens,
                 ):
                     manager = object.__new__(MooncakeKVManager)
                     manager.is_mla_backend = True
@@ -1007,7 +1006,7 @@ class TestQwen4StateWire(unittest.TestCase):
                         dst_data_ptrs=[0x2000, 0x2100],
                         item_lens=src_lens,
                         dst_item_lens=dst_lens,
-                        state_type=StateType.DSA,
+                        state_type=state_type,
                         src_layer_ids=layer_ids,
                         dst_layer_ids=layer_ids,
                     )
@@ -1016,11 +1015,23 @@ class TestQwen4StateWire(unittest.TestCase):
                     else:
                         self.assertIn("item length mismatch", reason)
 
+    def _dsa_send_manager(self, *, pp_size, prefill_start_layer):
+        manager = object.__new__(MooncakeKVManager)
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = pp_size
+        manager.kv_args = SimpleNamespace(
+            mla_compression_ratios=None, prefill_start_layer=prefill_start_layer
+        )
+        manager.state_strides_validated = set()
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        manager._transfer_data = Mock(return_value=0)
+        return manager
+
     def test_send_drops_entry_elided_by_either_peer(self):
-        """An entry elided on either side must not be sent. A dense prefill
-        against an elided decode used to keep the entry (the filter only looked
-        at the prefill length), writing index-K into a decode buffer that has no
-        memory and was never registered."""
+        """An index-K entry elided on either peer must not be sent: the elided
+        side has no memory behind it and never registered it."""
         for layer_ids in ([], [3, 4, 5]):
             for src_lens, dst_lens in (
                 ([132, 132, 132], [0, 132, 132]),
@@ -1029,18 +1040,7 @@ class TestQwen4StateWire(unittest.TestCase):
                 with self.subTest(
                     layer_ids=layer_ids, src_lens=src_lens, dst_lens=dst_lens
                 ):
-                    manager = object.__new__(MooncakeKVManager)
-                    manager.is_mla_backend = True
-                    manager.is_hybrid_mla_backend = False
-                    manager.pp_size = 1
-                    manager.kv_args = SimpleNamespace(
-                        mla_compression_ratios=None, prefill_start_layer=0
-                    )
-                    manager.state_strides_validated = set()
-                    manager.enable_custom_mem_pool = False
-                    manager.max_transfer_batch_indices = 0
-                    manager._transfer_data = Mock(return_value=0)
-
+                    manager = self._dsa_send_manager(pp_size=1, prefill_start_layer=0)
                     ret = manager._send_kvcache_generic(
                         "decode",
                         [0x1000, 0x1100, 0x1200],
@@ -1060,16 +1060,32 @@ class TestQwen4StateWire(unittest.TestCase):
                         "decode", [(0x1100, 0x2100, 132), (0x1200, 0x2200, 132)]
                     )
 
-    def test_dense_shape_keeps_positional_pairing_intact(self):
-        """Both peers still publish one entry per layer, so pairing is unchanged.
+    def test_pp_stage_send_maps_elision_to_the_stage_span(self):
+        """A PP>1 prefill stage sends to its own layer span of a whole-model
+        decode, and the either-peer elision filter must read the decode lengths
+        at that span, not at the stage-local index."""
+        # Stage 1 of PP=3 over 9 layers owns global layers 3..5. Prefill elides
+        # its local entry 0 (layer 3); decode elides global layer 5 only.
+        src_lens = [0, 132, 132]
+        dst_lens = [132, 132, 132, 132, 132, 0, 132, 132, 132]
+        dst_ptrs = [0x2000 + 0x100 * layer for layer in range(9)]
+        manager = self._dsa_send_manager(pp_size=3, prefill_start_layer=3)
 
-        This is what keeps the wire compatible with a peer that elides nothing:
-        counts match, and build_transfer_entry_pairs stays on its positional
-        path with no layer ids on either side.
-        """
-        self.assertEqual(
-            build_transfer_entry_pairs([], [], 6, 6),
-            [(i, i) for i in range(6)],
+        ret = manager._send_kvcache_generic(
+            "decode",
+            [0x1000, 0x1100, 0x1200],
+            dst_ptrs,
+            src_lens,
+            np.array([0], dtype=np.int32),
+            np.array([0], dtype=np.int32),
+            executor=None,
+            state_type=StateType.DSA,
+            dst_item_lens=dst_lens,
+        )
+
+        self.assertEqual(ret, 0)
+        manager._transfer_data.assert_called_once_with(
+            "decode", [(0x1100, dst_ptrs[4], 132)]
         )
 
     def test_compact_qsa_entries_map_by_global_layer_id(self):
