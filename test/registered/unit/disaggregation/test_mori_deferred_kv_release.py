@@ -368,14 +368,14 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
 class TestMoriElidedStateEntries(CustomTestCase):
     def test_one_sided_zero_length_entry_is_skipped_for_dsa_only(self):
-        """A 0-length entry on either peer is an elided DSA index-K layer with a
-        None descriptor, so DSA must skip it; any other state type must not
-        silently drop the entry."""
+        """A 0-length entry on either peer has no registered descriptor. DSA
+        must skip it as an elided index-K layer; any other state type must
+        fail loudly instead of dropping or submitting the entry."""
         for state_type, src_lens, dst_lens, expected_dst in (
             ("dsa", [132, 132, 132], [132, 0, 132], ["dst0", "dst2"]),
             ("dsa", [132, 0, 132], [132, 132, 132], ["dst0", "dst2"]),
-            ("swa", [132, 132, 132], [132, 0, 132], ["dst0", "dst1", "dst2"]),
-            ("swa", [132, 0, 132], [132, 132, 132], ["dst0", "dst1", "dst2"]),
+            ("swa", [132, 132, 132], [132, 0, 132], None),
+            ("swa", [132, 0, 132], [132, 132, 132], None),
         ):
             with self.subTest(
                 state_type=state_type, src_lens=src_lens, dst_lens=dst_lens
@@ -386,17 +386,25 @@ class TestMoriElidedStateEntries(CustomTestCase):
                 manager.pp_size = 1
                 manager._submit_batch_transfer_plan = MagicMock(return_value=[])
 
-                manager._send_swa_dsa_state(
-                    MagicMock(decode_tp_size=1),
-                    np.array([3], dtype=np.int32),
-                    np.array([5], dtype=np.int32),
-                    ["src0", "src1", "src2"],
-                    src_lens,
-                    ["dst0", "dst1", "dst2"],
-                    dst_lens,
-                    state_type,
-                )
+                def send():
+                    # Registration stores None for a 0-length buffer.
+                    return manager._send_swa_dsa_state(
+                        MagicMock(decode_tp_size=1),
+                        np.array([3], dtype=np.int32),
+                        np.array([5], dtype=np.int32),
+                        [None if n == 0 else f"src{i}" for i, n in enumerate(src_lens)],
+                        src_lens,
+                        [None if n == 0 else f"dst{i}" for i, n in enumerate(dst_lens)],
+                        dst_lens,
+                        state_type,
+                    )
 
+                if expected_dst is None:
+                    with self.assertRaisesRegex(RuntimeError, "only DSA index-K"):
+                        send()
+                    manager._submit_batch_transfer_plan.assert_not_called()
+                    continue
+                send()
                 self.assertEqual(
                     [
                         c.args[1]

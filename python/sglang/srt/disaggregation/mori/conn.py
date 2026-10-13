@@ -1688,12 +1688,13 @@ class MoriKVManager(CommonKVManager):
             *group_concurrent_contiguous(src_state_indices, dst_state_indices)
         )
 
-        statuses: List[TransferStatus] = []
+        # A 0-length entry has a None descriptor (never registered); only DSA
+        # index-K may be elided, on either peer. Check every entry before the
+        # first submission so a bad entry cannot leave a partial transfer.
+        entries = []
         for i, src_desc in enumerate(src_state_mem_descs):
             dst_desc = dst_state_mem_descs[i]
             state_item_len = src_state_item_lens[i]
-            # A 0-length entry has a None descriptor (never registered); only
-            # DSA index-K may be elided, on either peer.
             if is_elided_entry(
                 src_len=state_item_len,
                 dst_lens=dst_state_item_lens,
@@ -1701,7 +1702,16 @@ class MoriKVManager(CommonKVManager):
                 allow_elision=state_type == "dsa",
             ):
                 continue
+            if src_desc is None or dst_desc is None:
+                raise RuntimeError(
+                    f"{state_type} state entry {i} has no registered memory on "
+                    f"{'prefill' if src_desc is None else 'decode'} "
+                    "(0-length buffer); only DSA index-K may be elided"
+                )
+            entries.append((src_desc, dst_desc, state_item_len))
 
+        statuses: List[TransferStatus] = []
+        for src_desc, dst_desc, state_item_len in entries:
             statuses.extend(
                 self._submit_batch_transfer_plan(
                     src_desc,
