@@ -597,6 +597,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_DEDUPE_CHUNK_GATHER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA only. In the chunked PAGED prefill top-k, pass one page-table row per request (a view) to the fused sgl-kernel transform instead of a per-token copy. Same selected indices.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_INDEXER_TP_SPLIT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA only. Split the prefill indexer rows (logits and top-k) across attention TP ranks and all-gather the top-k. <code>0</code>: off. <code>1</code>: eager prefill only. <code>2</code>: also during breakable prefill CUDA graph replay (capture and warmup stay replicated). On the PAGED top-k path, set <code>SGLANG_DSA_DEDUPE_CHUNK_GATHER=1</code> too, or each split row copies its page-table row.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Smallest extend (in rows) that <code>SGLANG_DSA_INDEXER_TP_SPLIT</code> splits; shorter extends stay replicated.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1024</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_SEND_AUX_RDMA</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Send CPU-resident AUX data via RDMA instead of ZMQ TCP.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
