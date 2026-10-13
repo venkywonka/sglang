@@ -810,6 +810,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep a bf16 copy (the dequantized checkpoint weight) of the 128x128 block-FP8 <code>self_attn</code> projections listed in <code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MODULES</code>. Calls with at most <code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MAX_TOKENS</code> rows run a bf16 GEMM on the copy; larger calls keep the block-FP8 GEMM. Costs 2 bytes per weight element of each selected projection, per rank, on top of the FP8 weight. Not supported with <code>--enable-deterministic-inference</code> or online weight updates; layers on Marlin, ROCm fnuz, CPU, or MXFP8 keep the FP8-only path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MAX_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Largest row count (tokens in the call) that takes the bf16 copy when <code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ</code> is on.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>16</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MODULES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated projection names (the last part of the module prefix, under <code>self_attn</code>) that get a bf16 copy when <code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ</code> is on.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>fused_qkv_a_proj_with_mqa,q_b_proj,o_proj,wq_b</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_KERNEL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bf16 GEMM for the copy. <code>auto</code> uses the kernel the bf16 checkpoint path uses: the fused-A GEMM for <code>fused_qkv_a_proj_with_mqa</code> and the verified <code>q_b_proj</code> shapes on CUDA SM90+ with 1-16 rows, then <code>--bf16-gemm-backend</code> when it is <code>cutedsl</code>, else <code>F.linear</code>. <code>torch</code> always uses <code>F.linear</code>. Other values are rejected.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOE_NVFP4_DISPATCH</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
