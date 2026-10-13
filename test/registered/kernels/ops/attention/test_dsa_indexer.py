@@ -1,5 +1,6 @@
 import unittest
-from itertools import product
+from itertools import accumulate, product
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -13,7 +14,11 @@ _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer, rotate_activation
+from sglang.srt.layers.attention.dsa.dsa_indexer import (
+    Indexer,
+    _chunk_request_rows,
+    rotate_activation,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
     DSAIndexerMetadata,
@@ -1277,6 +1282,107 @@ class TestDSAIndexer(CustomTestCase):
                     backend.decode_cuda_graph_metadata["page_table"] is None,
                     should_use_topk_v2,
                 )
+
+    def test_dedupe_chunk_gather_matches_per_token_topk(self):
+        # SGLANG_DSA_DEDUPE_CHUNK_GATHER hands the fused PAGED transform one
+        # page_table_1 row per request plus per-request cu_seqlens_q, where the
+        # default chunk loop copies one row per token; both must pick the same
+        # pages for every chunk window, including rows shorter than topk.
+        topk = 2048
+        seq_lens = [3000, 1500, 2500, 4100, 2100]
+        extend_lens = [40, 20, 3, 65, 1]
+        bs, num_rows = len(seq_lens), sum(extend_lens)
+        total_k = sum(seq_lens)
+
+        row_starts, row_lens = [], []
+        for k_offset, seq, ext in zip(
+            [0] + list(accumulate(seq_lens))[:-1], seq_lens, extend_lens
+        ):
+            row_starts += [k_offset] * ext
+            row_lens += range(seq - ext + 1, seq + 1)
+        ks = torch.tensor(row_starts, dtype=torch.int32, device=self.device)
+        lengths = torch.tensor(row_lens, dtype=torch.int32, device=self.device)
+        logits = self._make_tie_free_logits(num_rows, total_k)
+
+        ext = torch.tensor(extend_lens, dtype=torch.int32, device=self.device)
+        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens_q[1:] = torch.cumsum(ext, dim=0)
+        token_to_batch_idx = torch.repeat_interleave(
+            torch.arange(bs, dtype=torch.int32, device=self.device), ext
+        )
+        # Request-distinct page ids, so a row read from the wrong request shows.
+        page_table_1 = (
+            torch.arange(max(seq_lens), dtype=torch.int32, device=self.device)
+            .unsqueeze(0)
+            .expand(bs, -1)
+            + torch.arange(bs, dtype=torch.int32, device=self.device).unsqueeze(1)
+            * total_k
+        ).contiguous()
+        seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
+        metadata = DSAIndexerMetadata(
+            attn_metadata=DSAMetadata(
+                page_size=1,
+                cache_seqlens_int32=seq_lens_t,
+                max_seq_len_q=max(extend_lens),
+                max_seq_len_k=max(seq_lens),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_q.clone(),
+                page_table_1=page_table_1,
+                real_page_table=page_table_1,
+                dsa_cache_seqlens_int32=lengths.clone(),
+                dsa_cu_seqlens_q=cu_seqlens_q.clone(),
+                dsa_cu_seqlens_k=cu_seqlens_q.clone(),
+                dsa_extend_seq_lens_list=extend_lens,
+                dsa_seqlens_expanded=lengths,
+            ),
+            topk_transform_method=TopkTransformMethod.PAGED,
+            topk_backend=DSATopKBackend.SGL_KERNEL,
+        )
+
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            envs.SGLANG_DSA_DEDUPE_CHUNK_GATHER.override(True),
+        ):
+            req_cu_cpu = Indexer._dedupe_chunk_gather_req_cu(
+                SimpleNamespace(dsa_enable_prefill_cp=False),
+                metadata=metadata,
+                q_offset=num_rows,
+            )
+            self.assertIsNotNone(req_cu_cpu, "dedupe gate rejected a valid extend")
+            for max_rows in (1, 7, 64, num_rows):
+                for start in range(0, num_rows, max_rows):
+                    end = min(start + max_rows, num_rows)
+                    with self.subTest(max_rows=max_rows, start=start):
+                        per_token = metadata.topk_transform(
+                            logits[start:end],
+                            topk,
+                            ks=ks[start:end],
+                            cu_seqlens_q=torch.ones(
+                                end - start, dtype=torch.int32, device=self.device
+                            ),
+                            ke_offset=lengths[start:end],
+                            batch_idx_list=token_to_batch_idx[start:end],
+                        )
+                        counts, request_rows = _chunk_request_rows(
+                            req_cu_cpu=req_cu_cpu,
+                            req_cu=metadata.attn_metadata.cu_seqlens_q,
+                            start=start,
+                            end=end,
+                        )
+                        dedupe = metadata.topk_transform(
+                            logits[start:end],
+                            topk,
+                            ks=ks[start:end],
+                            cu_seqlens_q=counts,
+                            ke_offset=lengths[start:end],
+                            batch_idx_list=request_rows,
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                torch.sort(dedupe, dim=-1).values,
+                                torch.sort(per_token, dim=-1).values,
+                            )
+                        )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
