@@ -7,6 +7,7 @@ projections. Backend sets adapt to the device SM, so one file covers
 SM90 / SM100 / SM120.
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -707,6 +708,9 @@ class TestBf16SmallMAttnProj(CustomTestCase):
             self, out, x.float() @ w16_ref[:half_n].float().T, rtol=5e-2, atol=1e-1
         )
 
+    # EnvField.override does not restore os.environ when its body raises,
+    # and _build raises inside two overrides here.
+    @mock.patch.dict(os.environ)
     def test_rejects_deterministic_inference_and_unknown_kernel(self):
         with get_exec().deterministic.override(enable_deterministic_inference=True):
             with self.assertRaisesRegex(ValueError, "deterministic"):
