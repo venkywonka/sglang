@@ -259,6 +259,7 @@ else:
     pass
 
 from sglang.kernels.ops.gemm.fused_a_gemm import (
+    Q_B_PROJ_FUSED_A_GEMM_SHAPES,
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
@@ -2210,12 +2211,11 @@ class DeepseekV2AttentionMLA(
         self.fused_a_gemm_backend = "auto"
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")
-        q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
         q_b_weight = (
             getattr(self.q_b_proj, "weight", None) if self.has_q_b_proj else None
         )
         self._q_b_proj_verified_shape = q_b_weight is not None and (
-            tuple(q_b_weight.shape) in q_b_proj_verified_shapes
+            tuple(q_b_weight.shape) in Q_B_PROJ_FUSED_A_GEMM_SHAPES
         )
         self._use_min_latency_q_b_gemm: bool | None = None
 

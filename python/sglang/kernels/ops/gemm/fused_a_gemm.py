@@ -32,13 +32,17 @@ _IS_CUDA = is_cuda()
 _DEVICE_SM = get_device_sm()
 
 
+# q_b_proj shapes (N, K) validated against the fused-A kernel.
+Q_B_PROJ_FUSED_A_GEMM_SHAPES = frozenset({(2048, 2048), (4096, 2048)})
+
+
+def fused_a_gemm_shape_eligible(*, n: int, k: int) -> bool:
+    return n % 16 == 0 and k % 256 == 0 and _IS_CUDA and _DEVICE_SM >= 90
+
+
 def fused_a_gemm_weight_eligible(layer: torch.nn.Module) -> bool:
-    return (
-        layer.weight.dtype == torch.bfloat16
-        and layer.weight.shape[0] % 16 == 0
-        and layer.weight.shape[1] % 256 == 0
-        and _IS_CUDA
-        and _DEVICE_SM >= 90
+    return layer.weight.dtype == torch.bfloat16 and fused_a_gemm_shape_eligible(
+        n=layer.weight.shape[0], k=layer.weight.shape[1]
     )
 
 

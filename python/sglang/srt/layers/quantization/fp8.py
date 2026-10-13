@@ -113,6 +113,7 @@ from sglang.srt.utils import (
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
+    print_info_once,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -403,9 +404,9 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUMXFP8LinearMethod(self)
-            method = Fp8LinearMethod(self)
-            method.bf16_small_m_proj = _bf16_small_m_proj_module(prefix)
-            return method
+            return Fp8LinearMethod(
+                self, bf16_small_m_proj=_bf16_small_m_proj_module(prefix)
+            )
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
@@ -486,12 +487,9 @@ class Fp8Config(QuantizationConfig):
             )
 
 
-_bf16_small_m_proj_stats = {"layers": 0, "bytes": 0, "logged": False}
-
-
 def _bf16_small_m_proj_module(prefix: str) -> Optional[str]:
-    """SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ: name of the self_attn projection at `prefix` if
-    it is selected for the small-M bf16 path, else None."""
+    """Name of the self_attn projection at `prefix` if
+    SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ selects it for the small-M bf16 path."""
     if not envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ.get():
         return None
     parts = prefix.split(".")
@@ -523,7 +521,12 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
+    def __init__(
+        self,
+        quant_config: Union[Fp8Config, W4AFp8Config],
+        *,
+        bf16_small_m_proj: Optional[str] = None,
+    ):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
@@ -578,9 +581,11 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
-        # Set by Fp8Config.get_quant_method; None keeps the FP8-only path.
-        self.bf16_small_m_proj: Optional[str] = None
+        # None keeps the FP8-only path.
+        self.bf16_small_m_proj = bf16_small_m_proj
         self.bf16_small_m_fused_a = None
+        if bf16_small_m_proj is not None:
+            self._init_bf16_small_m()
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -755,6 +760,8 @@ class Fp8LinearMethod(LinearMethodBase):
             is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
             params_dtype=params_dtype,
         )
+        # Set by _keep_bf16_small_m_weight; None keeps the FP8-only path.
+        layer.weight_bf16_small_m = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         use_deepgemm_runner = (
@@ -1241,9 +1248,29 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def _init_bf16_small_m(self) -> None:
+        if get_exec().deterministic.enable_deterministic_inference:
+            # Rows <= MAX_TOKENS skip activation quantization, so one request's
+            # logits would depend on the batch size it lands in.
+            raise ValueError(
+                "SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ cannot be combined with "
+                "--enable-deterministic-inference"
+            )
+        self.bf16_small_m_max_tokens = (
+            envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MAX_TOKENS.get()
+        )
+        self.bf16_small_m_kernel = envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_KERNEL.get()
+        if self.bf16_small_m_kernel not in ("auto", "torch"):
+            raise ValueError(
+                "SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_KERNEL must be 'auto' or "
+                f"'torch', got {self.bf16_small_m_kernel!r}"
+            )
+
     def _keep_bf16_small_m_weight(self, layer: Module) -> None:
-        """SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ: keep a bf16 copy of this block-FP8 weight,
+        """Keep a bf16 copy of this block-FP8 weight for calls with few rows,
         dequantized from the checkpoint scales before the UE8M0 requant."""
+        layer.weight_bf16_small_m = None
+        layer._derived_weight_cache_error = None
         weight, scale = layer.weight, layer.weight_scale_inv
         if (
             self.use_marlin
@@ -1252,20 +1279,28 @@ class Fp8LinearMethod(LinearMethodBase):
             or scale.dtype != torch.float32
             or getattr(scale, "format_ue8m0", False)
             or self.weight_block_size != [128, 128]
-            or getattr(layer, "orig_dtype", None) != torch.bfloat16
+            or layer.orig_dtype != torch.bfloat16
         ):
             return
         w16 = block_quant_dequant(
-            weight.data.to(scale.device), scale.data, [128, 128], torch.bfloat16
+            x_q_block=weight.data.to(scale.device),
+            x_s=scale.data,
+            block_size=[128, 128],
+            dtype=torch.bfloat16,
         )
-        if getattr(layer, "weight_bf16_small_m", None) is None:
-            _bf16_small_m_proj_stats["layers"] += 1
-            _bf16_small_m_proj_stats["bytes"] += w16.numel() * w16.element_size()
         layer.weight_bf16_small_m = w16
-        self.bf16_small_m_max_tokens = (
-            envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MAX_TOKENS.get()
+        layer._derived_weight_cache_error = (
+            "Online weight updates are not supported while "
+            "SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ bf16 weight copies are active: "
+            "captured CUDA graphs retain these derived weights. Restart without "
+            "it to allow online updates."
         )
-        self.bf16_small_m_kernel = envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_KERNEL.get()
+        from sglang.kernels.ops.gemm.fused_a_gemm import (
+            Q_B_PROJ_FUSED_A_GEMM_SHAPES,
+            dsv3_fused_a_gemm,
+            fused_a_gemm_shape_eligible,
+        )
+
         # Same small-M kernel the bf16 checkpoint path uses for these layers
         # (DeepseekV2AttentionMLA.prepare_qkv_latent / q_b_proj_forward).
         n, k = w16.shape
@@ -1275,71 +1310,52 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.bf16_small_m_proj == "fused_qkv_a_proj_with_mqa"
                 or (
                     self.bf16_small_m_proj == "q_b_proj"
-                    and (n, k) in ((2048, 2048), (4096, 2048))
+                    and (n, k) in Q_B_PROJ_FUSED_A_GEMM_SHAPES
                 )
             )
-            and n % 16 == 0
-            and k % 256 == 0
-            and torch.cuda.get_device_capability()[0] >= 9
-            and not get_exec().deterministic.enable_deterministic_inference
+            and fused_a_gemm_shape_eligible(n=n, k=k)
         ):
-            from sglang.kernels.ops.gemm.fused_a_gemm import dsv3_fused_a_gemm
-
             self.bf16_small_m_fused_a = dsv3_fused_a_gemm
+        print_info_once(
+            "SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ: bf16 copies of the block-FP8 "
+            f"{sorted(envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MODULES.get())} "
+            f"self_attn projections serve calls with <= "
+            f"{self.bf16_small_m_max_tokens} rows"
+        )
 
     def _apply_bf16_small_m(
         self, layer: Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
-        """SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ: run a call with <= max_tokens rows on the bf16
-        copy; None falls through to block-FP8. M is fixed per captured CUDA
-        graph, so each graph bakes in one path."""
-        w16 = getattr(layer, "weight_bf16_small_m", None)
+        """Run a call with <= max_tokens rows on the bf16 copy; None falls
+        through to block-FP8. M is fixed per captured CUDA graph, so each graph
+        bakes in one path."""
+        w16 = layer.weight_bf16_small_m
         if (
             w16 is None
             or isinstance(x, tuple)
             or x.dim() != 2
             or x.shape[0] > self.bf16_small_m_max_tokens
             or x.dtype != torch.bfloat16
+            # CP decode attention TP slices .weight in place but not this copy.
             or w16.shape != layer.weight.shape
         ):
             return None
-        m = x.shape[0]
         if (
             self.bf16_small_m_fused_a is not None
             and bias is None
-            and 1 <= m <= 16
+            and 1 <= x.shape[0] <= 16
             and x.is_contiguous()
         ):
-            kernel = "fused_a_gemm"
-            out = self.bf16_small_m_fused_a(x, w16.T)
-        elif (
-            self.bf16_small_m_kernel != "torch"
+            return self.bf16_small_m_fused_a(x, w16.T)
+        if (
+            self.bf16_small_m_kernel == "auto"
             and get_bf16_gemm_backend().is_cutedsl()
             and (bias is None or bias.dtype == torch.bfloat16)
         ):
-            kernel = "bf16_gemm_dispatch"
             if torch.compiler.is_compiling():
-                out = bf16_gemm_dispatch(x, w16, bias)
-            else:
-                out = _bf16_gemm_dispatch_impl(x, w16, bias)
-        else:
-            kernel = "torch"
-            out = F.linear(x, w16, bias)
-        if not _bf16_small_m_proj_stats["logged"]:
-            _bf16_small_m_proj_stats["logged"] = True
-            logger.info(
-                "SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ engaged: bf16 copies of %d layers "
-                "(%.2f GB), max_tokens=%d; first call %s M=%d N=%d K=%d kernel=%s",
-                _bf16_small_m_proj_stats["layers"],
-                _bf16_small_m_proj_stats["bytes"] / 1e9,
-                self.bf16_small_m_max_tokens,
-                self.bf16_small_m_proj,
-                m,
-                w16.shape[0],
-                w16.shape[1],
-                kernel,
-            )
-        return out
+                return bf16_gemm_dispatch(x, w16, bias)
+            return _bf16_gemm_dispatch_impl(x, w16, bias)
+        return F.linear(x, w16, bias)
 
     def apply(
         self,
