@@ -2,7 +2,8 @@
 
 Real layer path vs a dequantized-reference matmul, in four formats: FP8
 blockwise, MXFP8, 32-wide-K ue8m0 block FP8 served as MXFP8, and per-tensor
-FP8 (auto dispatch). Backend sets adapt to the device SM, so one file covers
+FP8 (auto dispatch), plus the small-M bf16 copy of block-FP8 attention
+projections. Backend sets adapt to the device SM, so one file covers
 SM90 / SM100 / SM120.
 """
 
@@ -12,11 +13,13 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -27,9 +30,9 @@ from sglang.test.layer_ut_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
 FP8_MAX = 448.0
 
@@ -579,6 +582,122 @@ class TestModeloptFp8PerTensorLinear(_LinearBackendCheck):
 
     def test_auto(self):
         self._check_backend("auto", ["auto"], PER_TENSOR_SHAPES, self._build_layer)
+
+
+@unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
+class TestBf16SmallMAttnProj(CustomTestCase):
+    """SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ: small-M calls on a bf16 copy of the
+    block-FP8 weight, larger calls on block-FP8."""
+
+    _O_PROJ = "model.layers.0.self_attn.o_proj"
+    _N, _K = 256, 384
+
+    @classmethod
+    def setUpClass(cls):
+        init_single_process_dist()
+
+    def setUp(self):
+        torch.manual_seed(7)
+        # deep_gemm requantizes the block scales to UE8M0 in place on SM100;
+        # the copy must come from the checkpoint scales, not the requant.
+        backend = "deep_gemm" if get_device_sm() in (90, 100, 103) else "auto"
+        patcher = mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend(backend)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _build(self, prefix=_O_PROJ, enabled=True):
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        with envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ.override(enabled):
+            layer = make_tp1_column_parallel_linear(
+                quant_config, self._N, self._K, prefix=prefix
+            )
+        w = torch.randn((self._N, self._K), device="cuda", dtype=torch.bfloat16)
+        w_fp8, scale_inv, _ = _quantize_fp8_blockwise(w / 10)
+        # Non-power-of-two scales, so a dequant after the UE8M0 requant differs.
+        scale_inv = scale_inv * 1.37
+        w16_ref = fp8_utils.block_quant_dequant(
+            w_fp8, scale_inv, [128, 128], torch.bfloat16
+        )
+        load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_inv)
+        layer.quant_method.process_weights_after_loading(layer)
+        return layer, w16_ref
+
+    @staticmethod
+    def _apply(layer, x):
+        """Output and whether the block-FP8 GEMM ran."""
+        method = layer.quant_method
+        with mock.patch.object(
+            method, "w8a8_block_fp8_linear", wraps=method.w8a8_block_fp8_linear
+        ) as block_fp8:
+            out = method.apply(layer, x)
+        return out, block_fp8.called
+
+    def test_small_m_matches_bf16_linear_on_checkpoint_dequant(self):
+        layer, w16_ref = self._build()
+        self.assertIsNotNone(layer._derived_weight_cache_error)
+        max_tokens = envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MAX_TOKENS.get()
+        for m in (1, max_tokens):
+            with self.subTest(m=m):
+                x = torch.randn(m, self._K, device="cuda", dtype=torch.bfloat16)
+                out, used_block_fp8 = self._apply(layer, x)
+                self.assertFalse(used_block_fp8)
+                torch.testing.assert_close(
+                    out, torch.nn.functional.linear(x, w16_ref), rtol=0, atol=0
+                )
+
+    def test_large_m_unlisted_module_and_flag_off_stay_on_block_fp8(self):
+        max_tokens = envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MAX_TOKENS.get()
+        on, w16_ref = self._build()
+        unlisted, _ = self._build(prefix="model.layers.0.mlp.down_proj")
+        off, _ = self._build(enabled=False)
+        self.assertIsNone(unlisted.weight_bf16_small_m)
+        self.assertIsNone(off.weight_bf16_small_m)
+        for name, layer, m in (
+            ("large_m", on, max_tokens + 1),
+            ("unlisted", unlisted, 1),
+            ("flag_off", off, 1),
+        ):
+            with self.subTest(case=name):
+                x = torch.randn(m, self._K, device="cuda", dtype=torch.bfloat16)
+                out, used_block_fp8 = self._apply(layer, x)
+                self.assertTrue(used_block_fp8)
+                self.assertEqual(tuple(out.shape), (m, self._N))
+        # The large-M call still computes this layer's product, on block-FP8.
+        x = torch.randn(max_tokens + 1, self._K, device="cuda", dtype=torch.bfloat16)
+        assert_output_close(
+            self,
+            self._apply(on, x)[0],
+            x.float() @ w16_ref.float().T,
+            atol=1e-1,
+            rtol=5e-2,
+        )
+
+    def test_sliced_weight_falls_back_to_block_fp8(self):
+        # CP decode attention TP slices .weight in place for the step, not the copy.
+        layer, w16_ref = self._build()
+        half_n = self._N // 2
+        layer.weight.data = layer.weight.data[:half_n]
+        layer.weight_scale_inv.data = layer.weight_scale_inv.data[: half_n // 128]
+        x = torch.randn(1, self._K, device="cuda", dtype=torch.bfloat16)
+        out, used_block_fp8 = self._apply(layer, x)
+        self.assertTrue(used_block_fp8)
+        assert_output_close(
+            self, out, x.float() @ w16_ref[:half_n].float().T, rtol=5e-2, atol=1e-1
+        )
+
+    def test_rejects_deterministic_inference_and_unknown_kernel(self):
+        with get_exec().deterministic.override(enable_deterministic_inference=True):
+            with self.assertRaisesRegex(ValueError, "deterministic"):
+                self._build()
+        with envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_KERNEL.override("Auto"):
+            with self.assertRaisesRegex(ValueError, "'auto' or 'torch'"):
+                self._build()
 
 
 if __name__ == "__main__":
