@@ -1346,7 +1346,7 @@ class Fp8LinearMethod(LinearMethodBase):
             and 1 <= x.shape[0] <= 16
             and x.is_contiguous()
         ):
-            return self.bf16_small_m_fused_a(x, w16.T)
+            return self.bf16_small_m_fused_a(mat_a=x, mat_b=w16.T)
         if (
             self.bf16_small_m_kernel == "auto"
             and get_bf16_gemm_backend().is_cutedsl()
