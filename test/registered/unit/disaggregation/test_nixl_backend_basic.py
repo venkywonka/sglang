@@ -535,6 +535,72 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
             )
         self.assertEqual(mgr.agent.initialize_xfer_calls, [])
 
+    def test_non_dsa_one_sided_zero_length_entry_is_rejected(self):
+        """Only DSA index-K may be elided on one peer; a 0-length decode entry
+        for any other state type is a layout disagreement and must fail."""
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = True
+        mgr.pp_size = 1
+        mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1], gpu_id=0)
+
+        with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
+            mgr._send_kvcache_generic(
+                peer_name="decode",
+                src_data_ptrs=[10, 11],
+                dst_data_ptrs=[20, 21],
+                item_lens=[32, 32],
+                prefill_data_indices=np.array([3], dtype=np.int32),
+                dst_data_indices=np.array([5], dtype=np.int32),
+                dst_gpu_id=0,
+                notif="swa-one-sided",
+                state_type=StateType.SWA,
+                src_layer_ids=[0, 1],
+                dst_layer_ids=[0, 1],
+                dst_item_lens=[32, 0],
+            )
+        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
+    def test_dsa_send_skips_index_k_elided_by_decode_only(self):
+        """A dense prefill against a decode that elided a shared-topk layer must
+        not build a descriptor for that layer: the decode never registered it,
+        so initialize_xfer() would reject the whole transfer."""
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = StagingFakeAgent()
+        mgr.is_mla_backend = True
+        mgr.pp_size = 1
+        mgr.kv_args = SimpleNamespace(
+            prefill_start_layer=0,
+            kv_data_ptrs=[1],
+            gpu_id=0,
+            state_types=[StateType.DSA],
+            state_data_ptrs=[[0x1000, 0x2000, 0x3000]],
+            state_item_lens=[[132, 132, 132]],
+            state_layer_ids=[[]],
+        )
+
+        handles = mgr.maybe_send_extra(
+            peer_name="decode",
+            prefill_state_indices=[[3]],
+            dst_state_data_ptrs=[[0x7000, 0x8000, 0x9000]],
+            dst_state_indices=[[5]],
+            dst_gpu_id=0,
+            notif="dsa",
+            decode_tp_size=1,
+            dst_state_item_lens=[[132, 0, 132]],
+        )
+
+        self.assertEqual(handles, ["handle"])
+        (src_reqs, _), (dst_reqs, _) = mgr.agent.get_xfer_descs_calls
+        self.assertEqual(
+            [int(addr) for addr in dst_reqs[:, 0]],
+            [0x7000 + 5 * 132, 0x9000 + 5 * 132],
+        )
+        self.assertEqual(
+            [int(addr) for addr in src_reqs[:, 0]],
+            [0x1000 + 3 * 132, 0x3000 + 3 * 132],
+        )
+
 
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):

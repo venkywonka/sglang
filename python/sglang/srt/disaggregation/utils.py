@@ -990,12 +990,10 @@ def is_elided_entry(
     dst_lens: Optional[Sequence[int]],
     dst_index: int,
     *,
-    allow_dst_elision: bool = True,
+    allow_dst_elision: bool = False,
 ) -> bool:
-    """True when either peer elided this entry (a 0-row DSA index-K buffer).
-
-    Nothing moves for it, and the elided side never registered the buffer.
-    allow_dst_elision=False restricts the skip to a zero-length source.
+    """True when this entry moves no bytes: the source is 0-length, or the
+    destination is 0-length and allow_dst_elision is set (DSA index-K only).
     """
     if src_len == 0:
         return True

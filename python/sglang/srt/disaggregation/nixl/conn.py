@@ -1777,6 +1777,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         if self.is_mla_backend or force_flat:
+            # Only DSA index-K may be elided on one peer (shared-topk layers).
+            allow_dst_elision = state_type == StateType.DSA
             if src_layer_ids or dst_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids or [],
@@ -1789,10 +1791,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # the paired entries must have identical layouts.
                 if dst_item_lens is not None:
                     for i, j in pairs:
-                        if is_elided_entry(item_lens[i], dst_item_lens, j):
-                            # A shared-topk layer carries no index-K. One peer
-                            # may elide it while the other does not -- HiSparse
-                            # runs decode-side only -- and neither reads it.
+                        if is_elided_entry(
+                            src_len=item_lens[i],
+                            dst_lens=dst_item_lens,
+                            dst_index=j,
+                            allow_dst_elision=allow_dst_elision,
+                        ):
                             continue
                         if item_lens[i] != dst_item_lens[j]:
                             raise RuntimeError(
@@ -1800,14 +1804,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 f"entries src[{i}]={item_lens[i]} "
                                 f"dst[{j}]={dst_item_lens[j]}"
                             )
-                # DSA index-K elision leaves a 0-row buffer on every shared-topk
-                # layer. Neither side registered it, so a descriptor built from
-                # it would fail in initialize_xfer(); drop it when either peer
-                # elided the entry.
+                # A 0-length entry was never registered by its owner, so a
+                # descriptor built from it would fail in initialize_xfer().
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
                     for i, j in pairs
-                    if not is_elided_entry(item_lens[i], dst_item_lens, j)
+                    if not is_elided_entry(
+                        src_len=item_lens[i],
+                        dst_lens=dst_item_lens,
+                        dst_index=j,
+                        allow_dst_elision=allow_dst_elision,
+                    )
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -1828,7 +1835,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     for layer_id in range(layers_current_pp_stage)
                     if not is_elided_entry(
-                        item_lens[layer_id], mapped_dst_lens, layer_id
+                        src_len=item_lens[layer_id],
+                        dst_lens=mapped_dst_lens,
+                        dst_index=layer_id,
+                        allow_dst_elision=allow_dst_elision,
                     )
                 ]
         else:
@@ -2762,6 +2772,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     notif=comp_notif,
                     state_type=st,
                     force_flat=True,
+                    dst_item_lens=dst_lens or None,
                 )
             elif st in (
                 StateType.SWA,

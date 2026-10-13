@@ -366,5 +366,41 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         log.assert_called_once()
 
 
+class TestMoriElidedStateEntries(CustomTestCase):
+    def test_decode_only_zero_length_entry_is_skipped_for_dsa_only(self):
+        """A decode-side 0-length entry is an elided DSA index-K layer with a
+        None descriptor, so DSA must skip it; any other state type must not
+        silently drop the entry."""
+        for state_type, expected_dst in (
+            ("dsa", ["dst0", "dst2"]),
+            ("swa", ["dst0", "dst1", "dst2"]),
+        ):
+            with self.subTest(state_type=state_type):
+                manager = _manager()
+                manager.is_mla_backend = True
+                manager.attn_tp_size = 1
+                manager.pp_size = 1
+                manager._submit_batch_transfer_plan = MagicMock(return_value=[])
+
+                manager._send_swa_dsa_state(
+                    MagicMock(decode_tp_size=1),
+                    np.array([3], dtype=np.int32),
+                    np.array([5], dtype=np.int32),
+                    ["src0", "src1", "src2"],
+                    [132, 132, 132],
+                    ["dst0", "dst1", "dst2"],
+                    [132, 0, 132],
+                    state_type,
+                )
+
+                self.assertEqual(
+                    [
+                        c.args[1]
+                        for c in manager._submit_batch_transfer_plan.call_args_list
+                    ],
+                    expected_dst,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

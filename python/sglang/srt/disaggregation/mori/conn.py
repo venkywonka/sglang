@@ -1692,11 +1692,14 @@ class MoriKVManager(CommonKVManager):
         for i, src_desc in enumerate(src_state_mem_descs):
             dst_desc = dst_state_mem_descs[i]
             state_item_len = src_state_item_lens[i]
-            if is_elided_entry(state_item_len, dst_state_item_lens, i):
-                # DSA index-K elision gives every shared-topk layer a 0-row
-                # buffer; either peer eliding it means nothing moves, and the
-                # descriptor describes an empty allocation. Skipping keeps the
-                # index alignment with state_mem_descs that registration relies on.
+            # A 0-length entry has a None descriptor (never registered); only
+            # DSA index-K may be elided on the decode side alone.
+            if is_elided_entry(
+                src_len=state_item_len,
+                dst_lens=dst_state_item_lens,
+                dst_index=i,
+                allow_dst_elision=state_type == "dsa",
+            ):
                 continue
 
             statuses.extend(
