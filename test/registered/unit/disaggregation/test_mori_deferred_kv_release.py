@@ -367,15 +367,19 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
 
 class TestMoriElidedStateEntries(CustomTestCase):
-    def test_decode_only_zero_length_entry_is_skipped_for_dsa_only(self):
-        """A decode-side 0-length entry is an elided DSA index-K layer with a
+    def test_one_sided_zero_length_entry_is_skipped_for_dsa_only(self):
+        """A 0-length entry on either peer is an elided DSA index-K layer with a
         None descriptor, so DSA must skip it; any other state type must not
         silently drop the entry."""
-        for state_type, expected_dst in (
-            ("dsa", ["dst0", "dst2"]),
-            ("swa", ["dst0", "dst1", "dst2"]),
+        for state_type, src_lens, dst_lens, expected_dst in (
+            ("dsa", [132, 132, 132], [132, 0, 132], ["dst0", "dst2"]),
+            ("dsa", [132, 0, 132], [132, 132, 132], ["dst0", "dst2"]),
+            ("swa", [132, 132, 132], [132, 0, 132], ["dst0", "dst1", "dst2"]),
+            ("swa", [132, 0, 132], [132, 132, 132], ["dst0", "dst1", "dst2"]),
         ):
-            with self.subTest(state_type=state_type):
+            with self.subTest(
+                state_type=state_type, src_lens=src_lens, dst_lens=dst_lens
+            ):
                 manager = _manager()
                 manager.is_mla_backend = True
                 manager.attn_tp_size = 1
@@ -387,9 +391,9 @@ class TestMoriElidedStateEntries(CustomTestCase):
                     np.array([3], dtype=np.int32),
                     np.array([5], dtype=np.int32),
                     ["src0", "src1", "src2"],
-                    [132, 132, 132],
+                    src_lens,
                     ["dst0", "dst1", "dst2"],
-                    [132, 0, 132],
+                    dst_lens,
                     state_type,
                 )
 

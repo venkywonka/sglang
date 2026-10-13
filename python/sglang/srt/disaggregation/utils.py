@@ -990,18 +990,17 @@ def is_elided_entry(
     dst_lens: Optional[Sequence[int]],
     dst_index: int,
     *,
-    allow_dst_elision: bool = False,
+    allow_elision: bool = False,
 ) -> bool:
-    """True when this entry moves no bytes: the source is 0-length, or the
-    destination is 0-length and allow_dst_elision is set (DSA index-K only).
+    """True when allow_elision is set (DSA index-K only) and either peer's entry
+    is 0-length; any other 0-length entry stays a layout mismatch.
     """
+    if not allow_elision:
+        return False
     if src_len == 0:
         return True
     return (
-        allow_dst_elision
-        and dst_lens is not None
-        and dst_index < len(dst_lens)
-        and dst_lens[dst_index] == 0
+        dst_lens is not None and dst_index < len(dst_lens) and dst_lens[dst_index] == 0
     )
 
 

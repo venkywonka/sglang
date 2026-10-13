@@ -1693,12 +1693,12 @@ class MoriKVManager(CommonKVManager):
             dst_desc = dst_state_mem_descs[i]
             state_item_len = src_state_item_lens[i]
             # A 0-length entry has a None descriptor (never registered); only
-            # DSA index-K may be elided on the decode side alone.
+            # DSA index-K may be elided, on either peer.
             if is_elided_entry(
                 src_len=state_item_len,
                 dst_lens=dst_state_item_lens,
                 dst_index=i,
-                allow_dst_elision=state_type == "dsa",
+                allow_elision=state_type == "dsa",
             ):
                 continue
 

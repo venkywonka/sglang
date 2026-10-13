@@ -980,13 +980,14 @@ class TestQwen4StateWire(unittest.TestCase):
         """A DSA index-K entry elided on one peer only (an elided prefill against
         a dense HiSparse decode, or the reverse) must pass the stride check on
         both pairing paths. A real stride disagreement, and a one-sided zero on
-        any non-DSA state type, must still be rejected."""
+        either peer for any non-DSA state type, must still be rejected."""
         for layer_ids in ([], [3, 4]):
             for state_type, src_lens, dst_lens, expect_ok in (
                 (StateType.DSA, [0, 132], [64, 132], True),
                 (StateType.DSA, [64, 132], [0, 132], True),
                 (StateType.DSA, [132, 132], [64, 132], False),
                 (StateType.SWA, [64, 132], [0, 132], False),
+                (StateType.SWA, [0, 132], [64, 132], False),
             ):
                 with self.subTest(
                     layer_ids=layer_ids,
@@ -1036,6 +1037,7 @@ class TestQwen4StateWire(unittest.TestCase):
             for src_lens, dst_lens in (
                 ([132, 132, 132], [0, 132, 132]),
                 ([0, 132, 132], [132, 132, 132]),
+                ([0, 132, 132], [0, 132, 132]),
             ):
                 with self.subTest(
                     layer_ids=layer_ids, src_lens=src_lens, dst_lens=dst_lens

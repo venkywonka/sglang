@@ -841,7 +841,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     src_len=item_lens[i],
                     dst_lens=dst_item_lens,
                     dst_index=j,
-                    allow_dst_elision=state_type == StateType.DSA,
+                    allow_elision=state_type == StateType.DSA,
                 ):
                     # One peer elided this index-K entry; no bytes move.
                     continue
@@ -870,7 +870,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_len=item_lens[layer_id],
                 dst_lens=mapped_dst_lens,
                 dst_index=layer_id,
-                allow_dst_elision=state_type == StateType.DSA,
+                allow_elision=state_type == StateType.DSA,
             ):
                 continue
             if item_lens[layer_id] != mapped_dst_lens[layer_id]:
@@ -1066,7 +1066,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_len=item_lens[i],
                         dst_lens=dst_item_lens,
                         dst_index=j,
-                        allow_dst_elision=state_type == StateType.DSA,
+                        allow_elision=state_type == StateType.DSA,
                     )
                 ]
             else:
@@ -1076,7 +1076,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 )
                 mapped_dst_lens = None
-                if dst_item_lens is not None:
+                if state_type == StateType.DSA and dst_item_lens is not None:
                     _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
                         item_lens, dst_item_lens, state_type
                     )
@@ -1091,7 +1091,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_len=item_lens[layer_id],
                         dst_lens=mapped_dst_lens,
                         dst_index=layer_id,
-                        allow_dst_elision=state_type == StateType.DSA,
+                        allow_elision=state_type == StateType.DSA,
                     )
                 ]
         else:

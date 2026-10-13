@@ -1778,7 +1778,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # Make descs
         if self.is_mla_backend or force_flat:
             # Only DSA index-K may be elided on one peer (shared-topk layers).
-            allow_dst_elision = state_type == StateType.DSA
+            allow_elision = state_type == StateType.DSA
             if src_layer_ids or dst_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids or [],
@@ -1795,7 +1795,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             src_len=item_lens[i],
                             dst_lens=dst_item_lens,
                             dst_index=j,
-                            allow_dst_elision=allow_dst_elision,
+                            allow_elision=allow_elision,
                         ):
                             continue
                         if item_lens[i] != dst_item_lens[j]:
@@ -1804,7 +1804,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 f"entries src[{i}]={item_lens[i]} "
                                 f"dst[{j}]={dst_item_lens[j]}"
                             )
-                # A 0-length entry was never registered by its owner, so a
+                # An elided DSA entry was never registered by its owner, so a
                 # descriptor built from it would fail in initialize_xfer().
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
@@ -1813,7 +1813,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         src_len=item_lens[i],
                         dst_lens=dst_item_lens,
                         dst_index=j,
-                        allow_dst_elision=allow_dst_elision,
+                        allow_elision=allow_elision,
                     )
                 ]
             else:
@@ -1823,7 +1823,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 )
                 mapped_dst_lens = None
-                if dst_item_lens is not None:
+                if allow_elision and dst_item_lens is not None:
                     _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
                         item_lens, dst_item_lens, state_type
                     )
@@ -1838,7 +1838,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         src_len=item_lens[layer_id],
                         dst_lens=mapped_dst_lens,
                         dst_index=layer_id,
-                        allow_dst_elision=allow_dst_elision,
+                        allow_elision=allow_elision,
                     )
                 ]
         else:

@@ -536,30 +536,35 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         self.assertEqual(mgr.agent.initialize_xfer_calls, [])
 
     def test_non_dsa_one_sided_zero_length_entry_is_rejected(self):
-        """Only DSA index-K may be elided on one peer; a 0-length decode entry
-        for any other state type is a layout disagreement and must fail."""
-        mgr = object.__new__(NixlKVManager)
-        mgr.agent = StagingFakeAgent()
-        mgr.is_mla_backend = True
-        mgr.pp_size = 1
-        mgr.kv_args = SimpleNamespace(prefill_start_layer=0, kv_data_ptrs=[1], gpu_id=0)
+        """Only DSA index-K may be elided on one peer; a 0-length entry on
+        either peer for any other state type is a layout disagreement and must
+        fail."""
+        for src_lens, dst_lens in (([32, 32], [32, 0]), ([0, 32], [32, 32])):
+            with self.subTest(src_lens=src_lens, dst_lens=dst_lens):
+                mgr = object.__new__(NixlKVManager)
+                mgr.agent = StagingFakeAgent()
+                mgr.is_mla_backend = True
+                mgr.pp_size = 1
+                mgr.kv_args = SimpleNamespace(
+                    prefill_start_layer=0, kv_data_ptrs=[1], gpu_id=0
+                )
 
-        with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
-            mgr._send_kvcache_generic(
-                peer_name="decode",
-                src_data_ptrs=[10, 11],
-                dst_data_ptrs=[20, 21],
-                item_lens=[32, 32],
-                prefill_data_indices=np.array([3], dtype=np.int32),
-                dst_data_indices=np.array([5], dtype=np.int32),
-                dst_gpu_id=0,
-                notif="swa-one-sided",
-                state_type=StateType.SWA,
-                src_layer_ids=[0, 1],
-                dst_layer_ids=[0, 1],
-                dst_item_lens=[32, 0],
-            )
-        self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+                with self.assertRaisesRegex(RuntimeError, "item length mismatch"):
+                    mgr._send_kvcache_generic(
+                        peer_name="decode",
+                        src_data_ptrs=[10, 11],
+                        dst_data_ptrs=[20, 21],
+                        item_lens=src_lens,
+                        prefill_data_indices=np.array([3], dtype=np.int32),
+                        dst_data_indices=np.array([5], dtype=np.int32),
+                        dst_gpu_id=0,
+                        notif="swa-one-sided",
+                        state_type=StateType.SWA,
+                        src_layer_ids=[0, 1],
+                        dst_layer_ids=[0, 1],
+                        dst_item_lens=dst_lens,
+                    )
+                self.assertEqual(mgr.agent.initialize_xfer_calls, [])
 
     def test_dsa_send_skips_index_k_elided_by_decode_only(self):
         """A dense prefill against a decode that elided a shared-topk layer must
