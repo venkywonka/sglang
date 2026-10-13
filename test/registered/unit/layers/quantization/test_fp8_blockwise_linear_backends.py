@@ -601,11 +601,20 @@ class TestBf16SmallMAttnProj(CustomTestCase):
         # deep_gemm requantizes the block scales to UE8M0 in place on SM100;
         # the copy must come from the checkpoint scales, not the requant.
         backend = "deep_gemm" if get_device_sm() in (90, 100, 103) else "auto"
+        self._use_backend(backend)
+
+    def _use_backend(self, backend: str):
+        """Select the FP8 GEMM runner for layers built after this call."""
         patcher = mock.patch.object(
             fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend(backend)
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def _randn_x(self, m: int) -> torch.Tensor:
+        # Same input scale as _check_backend, so the block-FP8 activation
+        # quantization error stays inside its tolerances.
+        return torch.randn(m, self._K, device="cuda", dtype=torch.bfloat16) / 10
 
     def _build(self, prefix=_O_PROJ, enabled=True):
         quant_config = Fp8Config(
@@ -644,7 +653,7 @@ class TestBf16SmallMAttnProj(CustomTestCase):
         max_tokens = envs.SGLANG_OPT_BF16_SMALL_M_ATTN_PROJ_MAX_TOKENS.get()
         for m in (1, max_tokens):
             with self.subTest(m=m):
-                x = torch.randn(m, self._K, device="cuda", dtype=torch.bfloat16)
+                x = self._randn_x(m)
                 out, used_block_fp8 = self._apply(layer, x)
                 self.assertFalse(used_block_fp8)
                 torch.testing.assert_close(
@@ -664,12 +673,12 @@ class TestBf16SmallMAttnProj(CustomTestCase):
             ("flag_off", off, 1),
         ):
             with self.subTest(case=name):
-                x = torch.randn(m, self._K, device="cuda", dtype=torch.bfloat16)
+                x = self._randn_x(m)
                 out, used_block_fp8 = self._apply(layer, x)
                 self.assertTrue(used_block_fp8)
                 self.assertEqual(tuple(out.shape), (m, self._N))
         # The large-M call still computes this layer's product, on block-FP8.
-        x = torch.randn(max_tokens + 1, self._K, device="cuda", dtype=torch.bfloat16)
+        x = self._randn_x(max_tokens + 1)
         assert_output_close(
             self,
             self._apply(on, x)[0],
@@ -680,11 +689,18 @@ class TestBf16SmallMAttnProj(CustomTestCase):
 
     def test_sliced_weight_falls_back_to_block_fp8(self):
         # CP decode attention TP slices .weight in place for the step, not the copy.
+        # Triton keeps the fp32 (N/128, K/128) checkpoint scales on every SM, so
+        # the dim-0 slice below is exact; deep_gemm on SM100 repacks them to
+        # UE8M0 with one row per weight row.
+        self._use_backend("triton")
         layer, w16_ref = self._build()
         half_n = self._N // 2
-        layer.weight.data = layer.weight.data[:half_n]
-        layer.weight_scale_inv.data = layer.weight_scale_inv.data[: half_n // 128]
-        x = torch.randn(1, self._K, device="cuda", dtype=torch.bfloat16)
+        # Same dim-0 slice as CpDecodeAttnTpContext._slice for decode TP 2, rank 0.
+        for name in ("weight", "weight_scale_inv"):
+            param = getattr(layer, name)
+            param.data = param.data.narrow(0, 0, param.shape[0] // 2)
+        self.assertEqual(tuple(layer.weight.shape), (half_n, self._K))
+        x = self._randn_x(1)
         out, used_block_fp8 = self._apply(layer, x)
         self.assertTrue(used_block_fp8)
         assert_output_close(
